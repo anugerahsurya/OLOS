@@ -8,6 +8,7 @@ import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
 import seaborn as sns
+from scipy.stats import randint
 
 # === Library untuk Machine Learning & Preprocessing ===
 from sklearn.model_selection import train_test_split, cross_val_score, StratifiedKFold
@@ -21,6 +22,8 @@ from sklearn.metrics import (
     accuracy_score, balanced_accuracy_score, f1_score,
     roc_auc_score, classification_report, confusion_matrix
 )
+
+from sklearn.preprocessing import label_binarize
 from statsmodels.stats.outliers_influence import variance_inflation_factor
 from statsmodels.tools.tools import add_constant
 
@@ -306,4 +309,167 @@ def eksplorasiBestFitur(fixed_features, target, data, case=1):
     hasil_df = pd.DataFrame(results)
     hasil_df = hasil_df.sort_values(by='score', ascending=(case == 1)).reset_index(drop=True)
     return hasil_df
+
+def klasifikasikan_indeks_gabungan(nilai):
+    if nilai < 1: return 0
+    elif nilai < 2: return 1
+    elif nilai < 3: return 2
+    elif nilai < 4: return 3
+    else: return 4
+
+
+def get_model_and_params(model_type, trial):
+    if model_type == "rf":
+        params = {
+            "n_estimators": trial.suggest_int("n_estimators", 50, 300),
+            "max_depth": trial.suggest_int("max_depth", 3, 20),
+            "min_samples_split": trial.suggest_int("min_samples_split", 2, 10),
+            "min_samples_leaf": trial.suggest_int("min_samples_leaf", 1, 5),
+        }
+        model_cls = RandomForestRegressor
+    elif model_type == "knn":
+        params = {
+            "n_neighbors": trial.suggest_int("n_neighbors", 3, 30),
+            "weights": trial.suggest_categorical("weights", ["uniform", "distance"]),
+            "p": trial.suggest_int("p", 1, 2)
+        }
+        model_cls = KNeighborsRegressor
+    elif model_type == "catboost":
+        params = {
+            "iterations": trial.suggest_int("iterations", 100, 500),
+            "depth": trial.suggest_int("depth", 4, 10),
+            "learning_rate": trial.suggest_float("learning_rate", 0.01, 0.3),
+            "l2_leaf_reg": trial.suggest_float("l2_leaf_reg", 1, 10),
+            "verbose": 0
+        }
+        model_cls = CatBoostRegressor
+    else:
+        raise ValueError(f"Model {model_type} tidak dikenali.")
+    
+    return model_cls, params
+
+
+def optimasiIndeksGabungan(
+    X_A_train, X_A_val, yA_train, yA_val,
+    X_B_train, X_B_val, yB_train, yB_val,
+    X_C_train, X_C_val, yC_train, yC_val,
+    n_trials=50,
+    random_state=42
+):
+    def objective(trial):
+        model_A_type = trial.suggest_categorical("model_A", ["rf", "knn", "catboost"])
+        model_B_type = trial.suggest_categorical("model_B", ["rf", "knn", "catboost"])
+        model_C_type = trial.suggest_categorical("model_C", ["rf", "knn", "catboost"])
+
+        model_A_cls, params_A = get_model_and_params(model_A_type, trial)
+        model_B_cls, params_B = get_model_and_params(model_B_type, trial)
+        model_C_cls, params_C = get_model_and_params(model_C_type, trial)
+
+        model_A = model_A_cls(**params_A)
+        model_B = model_B_cls(**params_B)
+        model_C = model_C_cls(**params_C)
+
+        model_A.fit(X_A_train, yA_train)
+        model_B.fit(X_B_train, yB_train)
+        model_C.fit(X_C_train, yC_train)
+
+        pred_A = model_A.predict(X_A_val)
+        pred_B = model_B.predict(X_B_val)
+        pred_C = model_C.predict(X_C_val)
+
+        gabungan_pred = (pred_A + pred_B + pred_C) / 3
+        gabungan_true = (yA_val + yB_val + yC_val) / 3
+
+        klasifikasi_pred = [klasifikasikan_indeks_gabungan(x) for x in gabungan_pred]
+        klasifikasi_true = [klasifikasikan_indeks_gabungan(x) for x in gabungan_true]
+
+        return f1_score(klasifikasi_true, klasifikasi_pred, average='macro')
+
+    study = optuna.create_study(direction="maximize")
+    study.optimize(objective, n_trials=n_trials)
+    best_params = study.best_params
+
+    # Ambil model terbaik
+    model_A_type = best_params["model_A"]
+    model_B_type = best_params["model_B"]
+    model_C_type = best_params["model_C"]
+
+    # Bangun ulang model dengan best params
+    trial_fixed = optuna.trial.FixedTrial(best_params)
+    model_A_cls, config_A = get_model_and_params(model_A_type, trial_fixed)
+    model_B_cls, config_B = get_model_and_params(model_B_type, trial_fixed)
+    model_C_cls, config_C = get_model_and_params(model_C_type, trial_fixed)
+
+    model_A = model_A_cls(**config_A)
+    model_B = model_B_cls(**config_B)
+    model_C = model_C_cls(**config_C)
+
+    model_A.fit(X_A_train, yA_train)
+    model_B.fit(X_B_train, yB_train)
+    model_C.fit(X_C_train, yC_train)
+
+    pred_A = model_A.predict(X_A_val)
+    pred_B = model_B.predict(X_B_val)
+    pred_C = model_C.predict(X_C_val)
+
+    gabungan_pred = (pred_A + pred_B + pred_C) / 3
+    gabungan_true = (yA_val + yB_val + yC_val) / 3
+
+    klasifikasi_pred = [klasifikasikan_indeks_gabungan(x) for x in gabungan_pred]
+    klasifikasi_true = [klasifikasikan_indeks_gabungan(x) for x in gabungan_true]
+
+    # Evaluasi lengkap
+    f1_macro = f1_score(klasifikasi_true, klasifikasi_pred, average='macro')
+    balanced_acc = balanced_accuracy_score(klasifikasi_true, klasifikasi_pred)
+    cls_report = classification_report(klasifikasi_true, klasifikasi_pred, output_dict=True)
+    conf_matrix = confusion_matrix(klasifikasi_true, klasifikasi_pred)
+
+    # ROC AUC (binarize label)
+    labels = sorted(set(klasifikasi_true + klasifikasi_pred))
+    y_true_bin = label_binarize(klasifikasi_true, classes=labels)
+    y_pred_bin = label_binarize(klasifikasi_pred, classes=labels)
+    roc_auc = roc_auc_score(y_true_bin, y_pred_bin, average='macro', multi_class='ovr')
+
+    # Feature importance helper
+    def extract_importance(model, model_type, feature_names):
+        if model_type == "rf":
+            return dict(zip(feature_names, model.feature_importances_))
+        elif model_type == "catboost":
+            importances = model.get_feature_importance()
+            return dict(zip(feature_names, importances))
+        else:  # knn tidak memiliki feature importance
+            return None
+
+    def safe_colnames(X, fallback_prefix="X"):
+        if hasattr(X, "columns"):
+            return X.columns
+        return [f"{fallback_prefix}{i}" for i in range(X.shape[1])]
+
+    importance_A = extract_importance(model_A, model_A_type, safe_colnames(X_A_train, "A"))
+    importance_B = extract_importance(model_B, model_B_type, safe_colnames(X_B_train, "B"))
+    importance_C = extract_importance(model_C, model_C_type, safe_colnames(X_C_train, "C"))
+
+    return {
+        "model_A": model_A_type,
+        "params_A": config_A,
+        "importance_A": importance_A,
+
+        "model_B": model_B_type,
+        "params_B": config_B,
+        "importance_B": importance_B,
+
+        "model_C": model_C_type,
+        "params_C": config_C,
+        "importance_C": importance_C,
+
+        "f1_macro": f1_macro,
+        "balanced_accuracy": balanced_acc,
+        "confusion_matrix": conf_matrix,
+        "classification_report": cls_report,
+        "roc_auc_macro": roc_auc
+    }
+
+
+
+
 
